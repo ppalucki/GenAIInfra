@@ -37,17 +37,26 @@ import (
 	mcv1alpha3 "github.com/opea-project/GenAIInfra/microservices-connector/api/v1alpha3"
 	flag "github.com/spf13/pflag"
 
-	// Prometheus and opentelemetry imports
+	// Metrcis: Prometheus and opentelemetry imports
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/prometheus"
-	api "go.opentelemetry.io/otel/metric"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/metric"
+	api "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
+
+	// OTEL TRACES
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 const (
@@ -68,14 +77,11 @@ var (
 	transport       = &http.Transport{
 		MaxIdleConns:          1000,
 		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       2 * time.Minute,
-		TLSHandshakeTimeout:   time.Minute,
-		ExpectContinueTimeout: 30 * time.Second,
+		IdleConnTimeout:       10 * time.Minute,
+		TLSHandshakeTimeout:   10 * time.Minute,
+		ExpectContinueTimeout: 600 * time.Second,
 	}
-	callClient = http.Client{
-		Transport: otelhttp.NewTransport(transport),
-		Timeout:   30 * time.Second,
-	}
+	mainTracer trace.Tracer
 )
 
 type EnsembleStepOutput struct {
@@ -99,8 +105,7 @@ var (
 	pipelineLatencyMeasure   metric.Float64Histogram
 )
 
-func init() {
-
+func initMeter() {
 	// The exporter embeds a default OpenTelemetry Reader and
 	// implements prometheus.Collector, allowing it to be used as
 	// both a Reader and Collector.
@@ -153,6 +158,48 @@ func init() {
 	if err != nil {
 		log.Error(err, "metrics: cannot register pipeline histogram measure")
 	}
+}
+
+func initTracer() (*sdktrace.TracerProvider, error) {
+	// Create stdout exporter to be able to retrieve
+	// the collected spans.
+	exporter1, err := stdouttrace.New(
+		stdouttrace.WithPrettyPrint(),
+		//stdouttrace.WithWriter(os.Stderr),
+	)
+	ctx := context.Background()
+	exporter2, err := otlptracehttp.New(ctx)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
+	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(exporter2),
+		sdktrace.WithSyncer(exporter1),
+		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName("router-service"))),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	mainTracer = otel.GetTracerProvider().Tracer("graphtracer")
+	return tp, err
+}
+
+func init() {
+	initMeter()
+	_, err := initTracer()
+	if err != nil {
+		log.Error(err, "failed to initTracer")
+	}
+	// defer func() {
+	// 	if err := tp.Shutdown(context.Background()); err != nil {
+	// 		log.Info("Error shutting down tracer provider: %v", err)
+	// 	}
+	// }()
 }
 
 func (ReadCloser) Close() error {
@@ -229,6 +276,7 @@ func prepareErrorResponse(err error, errorMessage string) []byte {
 }
 
 func callService(
+	ctx context.Context,
 	step *mcv1alpha3.Step,
 	serviceUrl string,
 	input []byte,
@@ -251,7 +299,8 @@ func callService(
 		}
 	}
 
-	req, err := http.NewRequest("POST", serviceUrl, bytes.NewBuffer(input))
+	//req, err := http.NewRequest("POST", serviceUrl, bytes.NewBuffer(input))
+	req, err := http.NewRequestWithContext(ctx, "POST", serviceUrl, bytes.NewBuffer(input))
 	if err != nil {
 		log.Error(err, "An error occurred while preparing request object with serviceUrl.", "serviceUrl", serviceUrl)
 		return nil, 500, err
@@ -260,7 +309,30 @@ func callService(
 	if val := req.Header.Get("Content-Type"); val == "" {
 		req.Header.Add("Content-Type", "application/json")
 	}
+	// normal client
+	// callClient := http.Client{
+	// 	Transport: transport,
+	// 	Timeout:   600 * time.Second,
+	// }
 
+	// otel client
+	// we want to use existing tracer instad creating a new one, but how !!!
+	callClient := http.Client{
+		Transport: otelhttp.NewTransport(
+			transport,
+			// otelhttp.WithTracerProvider(otel.GetTracerProvider()),
+			//otelhttp.WithTracer(mainTracer),  #### TRIK
+			// otelhttp.WithPublicEndpoint(),
+
+			// GEnerate EXTRA spans for dns/sent/reciver
+			// otelhttp.WithClientTrace(
+			// 	func(ctx context.Context) *httptrace.ClientTrace {
+			// 		return otelhttptrace.NewClientTrace(ctx)
+			// 	},
+			// ),
+		),
+		Timeout: 600 * time.Second,
+	}
 	resp, err := callClient.Do(req)
 	if err != nil {
 		log.Error(err, "An error has occurred while calling service", "service", serviceUrl)
@@ -281,6 +353,7 @@ func getServiceURLByStepTarget(step *mcv1alpha3.Step, svcNameSpace string) strin
 }
 
 func executeStep(
+	ctx context.Context,
 	step *mcv1alpha3.Step,
 	graph mcv1alpha3.GMConnector,
 	initInput []byte,
@@ -289,10 +362,10 @@ func executeStep(
 ) (io.ReadCloser, int, error) {
 	if step.NodeName != "" {
 		// when nodeName is specified make a recursive call for routing to next step
-		return routeStep(step.NodeName, graph, initInput, input, headers)
+		return routeStep(ctx, step.NodeName, graph, initInput, input, headers)
 	}
 	serviceURL := getServiceURLByStepTarget(step, graph.Namespace)
-	return callService(step, serviceURL, input, headers)
+	return callService(ctx, step, serviceURL, input, headers)
 }
 
 func mergeRequests(respReq []byte, initReqData map[string]interface{}) []byte {
@@ -322,6 +395,7 @@ func mergeRequests(respReq []byte, initReqData map[string]interface{}) []byte {
 }
 
 func handleSwitchNode(
+	ctx context.Context,
 	route *mcv1alpha3.Step,
 	graph mcv1alpha3.GMConnector,
 	initInput []byte,
@@ -336,7 +410,7 @@ func handleSwitchNode(
 		stepType = ServiceNode
 	}
 	log.Info("Starting execution of step", "Node Name", route.NodeName, "type", stepType, "stepName", route.StepName)
-	if responseBody, statusCode, err = executeStep(route, graph, initInput, request, headers); err != nil {
+	if responseBody, statusCode, err = executeStep(ctx, route, graph, initInput, request, headers); err != nil {
 		return nil, 500, err
 	}
 
@@ -352,7 +426,9 @@ func handleSwitchNode(
 	return responseBody, statusCode, nil
 }
 
-func handleSwitchPipeline(nodeName string,
+func handleSwitchPipeline(
+	ctx context.Context,
+	nodeName string,
 	graph mcv1alpha3.GMConnector,
 	initInput []byte,
 	input []byte,
@@ -410,7 +486,7 @@ func handleSwitchPipeline(nodeName string,
 			request = mergeRequests(responseBytes, initReqData)
 		}
 		log.Info("Print New Request Bytes", "Request Bytes", request)
-		responseBody, statusCode, err = handleSwitchNode(&route, graph, initInput, request, headers)
+		responseBody, statusCode, err = handleSwitchNode(ctx, &route, graph, initInput, request, headers)
 		if err != nil {
 			return nil, statusCode, err
 		}
@@ -418,7 +494,9 @@ func handleSwitchPipeline(nodeName string,
 	return responseBody, statusCode, err
 }
 
-func handleEnsemblePipeline(nodeName string,
+func handleEnsemblePipeline(
+	ctx context.Context,
+	nodeName string,
 	graph mcv1alpha3.GMConnector,
 	initInput []byte,
 	input []byte,
@@ -437,7 +515,7 @@ func handleEnsemblePipeline(nodeName string,
 		resultChan := make(chan EnsembleStepOutput)
 		ensembleRes[i] = resultChan
 		go func() {
-			responseBody, statusCode, err := executeStep(step, graph, initInput, input, headers)
+			responseBody, statusCode, err := executeStep(ctx, step, graph, initInput, input, headers)
 			if err == nil {
 				output, rerr := io.ReadAll(responseBody)
 				if rerr != nil {
@@ -493,7 +571,9 @@ func handleEnsemblePipeline(nodeName string,
 	return combinedIOReader, 200, nil
 }
 
-func handleSequencePipeline(nodeName string,
+func handleSequencePipeline(
+	ctx context.Context,
+	nodeName string,
 	graph mcv1alpha3.GMConnector,
 	initInput []byte,
 	input []byte,
@@ -556,7 +636,7 @@ func handleSequencePipeline(nodeName string,
 				return responseBody, 500, nil
 			}
 		}
-		if responseBody, statusCode, err = executeStep(step, graph, initInput, request, headers); err != nil {
+		if responseBody, statusCode, err = executeStep(ctx, step, graph, initInput, request, headers); err != nil {
 			return nil, 500, err
 		}
 		/*
@@ -579,7 +659,9 @@ func handleSequencePipeline(nodeName string,
 	return responseBody, statusCode, nil
 }
 
-func routeStep(nodeName string,
+func routeStep(
+	ctx context.Context,
+	nodeName string,
 	graph mcv1alpha3.GMConnector,
 	initInput, input []byte,
 	headers http.Header,
@@ -589,27 +671,37 @@ func routeStep(nodeName string,
 	log.Info("Current Node", "Node Name", nodeName)
 
 	if currentNode.RouterType == mcv1alpha3.Switch {
-		return handleSwitchPipeline(nodeName, graph, initInput, input, headers)
+		return handleSwitchPipeline(ctx, nodeName, graph, initInput, input, headers)
 	}
 
 	if currentNode.RouterType == mcv1alpha3.Ensemble {
-		return handleEnsemblePipeline(nodeName, graph, initInput, input, headers)
+		return handleEnsemblePipeline(ctx, nodeName, graph, initInput, input, headers)
 	}
 
 	if currentNode.RouterType == mcv1alpha3.Sequence {
-		return handleSequencePipeline(nodeName, graph, initInput, input, headers)
+		return handleSequencePipeline(ctx, nodeName, graph, initInput, input, headers)
 	}
 	log.Error(nil, "invalid route type", "type", currentNode.RouterType)
 	return nil, 500, fmt.Errorf("invalid route type: %v", currentNode.RouterType)
 }
 
 func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
-	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Minute)
 	defer cancel()
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+
+		// graphtracer := otel.GetTracerProvider().Tracer("graphtracer")
+		ctx, span := mainTracer.Start(ctx, "read request")
+		println("moj TRAK", mainTracer)
+		fmt.Printf("moj TRAK%+v\n", mainTracer)
+		// span := trace.SpanFromContext(ctx)
+
+		uk := attribute.Key("foo")
+		bag := baggage.FromContext(ctx)
+		span.AddEvent("handling this...", trace.WithAttributes(uk.String(bag.Member("bar").Value())))
 
 		allTokensStartTime := time.Now()
 		inputBytes, err := io.ReadAll(req.Body)
@@ -618,8 +710,11 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
+		span.End()
 
-		responseBody, statusCode, err := routeStep(defaultNodeName, *mcGraph, inputBytes, inputBytes, req.Header)
+		ctx, span = mainTracer.Start(ctx, "router step")
+		responseBody, statusCode, err := routeStep(ctx, defaultNodeName, *mcGraph, inputBytes, inputBytes, req.Header)
+		span.End()
 
 		pipelineLatencyMeasure.Record(ctx, float64(time.Since(allTokensStartTime))/float64(time.Millisecond))
 
@@ -642,11 +737,14 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		firstTokenCollected := false
 		buffer := make([]byte, BufferSize)
+		ctx, spanFor := mainTracer.Start(ctx, "for")
 		for {
 
+			ctx, span = mainTracer.Start(ctx, "read response partial")
 			// measure time of reading another portion of response
 			tokenStartTime := time.Now()
 			n, err := responseBody.Read(buffer)
+			span.End()
 			elapsedTimeMilisecond := float64(time.Since(tokenStartTime)) / float64(time.Millisecond)
 
 			if !firstTokenCollected {
@@ -666,10 +764,13 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 			}
 
 			// Write the chunk to the ResponseWriter
+			ctx, span = mainTracer.Start(ctx, "reponse write partial")
+			// measure time of reading another portion of response
 			if _, err := w.Write(buffer[:n]); err != nil {
 				log.Error(err, "failed to write to ResponseWriter")
 				return
 			}
+			span.End()
 			// Flush the data to the client immediately
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -678,6 +779,7 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 		}
+		spanFor.End()
 
 		allTokensElapsedTimeMilisecond := float64(time.Since(allTokensStartTime)) / float64(time.Millisecond)
 		allTokenLatencyMeasure.Record(ctx, allTokensElapsedTimeMilisecond)
@@ -831,8 +933,17 @@ func initializeRoutes() *http.ServeMux {
 	// "http.server.response.size" - Int64Counter  - "Measures the size of HTTP response messages" (Incoming response bytes total)
 	// "http.server.duration" - Float64histogram "Measures the duration of inbound HTTP requests." (Incoming end to end duration, milliseconds)
 	handleFunc := func(pattern string, handlerFunc func(http.ResponseWriter, *http.Request), operation string) {
-		handler := otelhttp.NewHandler(otelhttp.WithRouteTag(pattern, http.HandlerFunc(handlerFunc)), operation)
+		// WRAPPED
+		handler := otelhttp.NewHandler(
+			otelhttp.WithRouteTag(pattern, http.HandlerFunc(handlerFunc)),
+			operation,
+			// otelhttp.WithTracer(mainTracer), // TRIK
+			//otelhttp.WithTracerProvider(otel.GetTracerProvider()), # breaks there is missing handler trace !!!
+		)
 		mux.Handle(pattern, handler)
+
+		// RAW
+		// mux.Handle(pattern, http.HandlerFunc(handlerFunc))
 	}
 
 	handleFunc("/", mcGraphHandler, "mcGraphHandler")
@@ -840,7 +951,7 @@ func initializeRoutes() *http.ServeMux {
 
 	promHandler := promhttp.Handler()
 	handleFunc("/metrics", promHandler.ServeHTTP, "metrics")
-	log.Info("Metrics exposed on /metrics.")
+	log.Info("v2 Metrics exposed on /metrics.")
 
 	return mux
 }
