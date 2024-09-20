@@ -20,6 +20,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 
 	// "regexp"
@@ -39,6 +40,7 @@ import (
 
 	// Metrcis: Prometheus and opentelemetry imports
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -81,7 +83,7 @@ var (
 		TLSHandshakeTimeout:   10 * time.Minute,
 		ExpectContinueTimeout: 600 * time.Second,
 	}
-	mainTracer trace.Tracer
+	// mainTracer trace.Tracer
 )
 
 type EnsembleStepOutput struct {
@@ -185,7 +187,7 @@ func initTracer() (*sdktrace.TracerProvider, error) {
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
-	mainTracer = otel.GetTracerProvider().Tracer("graphtracer")
+	// mainTracer = otel.GetTracerProvider().Tracer("graphtracer")
 	return tp, err
 }
 
@@ -325,11 +327,11 @@ func callService(
 			// otelhttp.WithPublicEndpoint(),
 
 			// GEnerate EXTRA spans for dns/sent/reciver
-			// otelhttp.WithClientTrace(
-			// 	func(ctx context.Context) *httptrace.ClientTrace {
-			// 		return otelhttptrace.NewClientTrace(ctx)
-			// 	},
-			// ),
+			otelhttp.WithClientTrace(
+				func(ctx context.Context) *httptrace.ClientTrace {
+					return otelhttptrace.NewClientTrace(ctx)
+				},
+			),
 		),
 		Timeout: 600 * time.Second,
 	}
@@ -693,10 +695,8 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 	go func() {
 		defer close(done)
 
-		// graphtracer := otel.GetTracerProvider().Tracer("graphtracer")
+		mainTracer := otel.GetTracerProvider().Tracer("graphtracer")
 		ctx, span := mainTracer.Start(ctx, "read request")
-		println("moj TRAK", mainTracer)
-		fmt.Printf("moj TRAK%+v\n", mainTracer)
 		// span := trace.SpanFromContext(ctx)
 
 		uk := attribute.Key("foo")
