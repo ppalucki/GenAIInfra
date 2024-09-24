@@ -20,7 +20,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/http/httptrace"
 	"os"
 
 	// "regexp"
@@ -28,9 +27,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MrAlias/otlpr"
 	"github.com/tidwall/gjson"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	// "crypto/rand"
 	// "math/big"
@@ -40,7 +41,6 @@ import (
 
 	// Metrcis: Prometheus and opentelemetry imports
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -51,6 +51,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	api "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
@@ -62,6 +63,8 @@ import (
 )
 
 const (
+	OtelServiceName = "router-service"
+
 	BufferSize    = 1024
 	MaxGoroutines = 1024
 	ServiceURL    = "serviceUrl"
@@ -162,46 +165,70 @@ func initMeter() {
 	}
 }
 
-func initTracer() (*sdktrace.TracerProvider, error) {
-	// Create stdout exporter to be able to retrieve
-	// the collected spans.
-	exporter1, err := stdouttrace.New(
+func initLogs() {
+	// https://github.com/MrAlias/otlpr
+	otlpTarget, configured := os.LookupEnv("OTEL_LOGS_GRPC_ENDPOINT")
+	if configured {
+		conn, err := grpc.NewClient(otlpTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Println("error", err)
+			//log.Error(err, "failed to configure logger grpc connection")
+			os.Exit(1)
+		}
+		res := resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(OtelServiceName),
+		)
+		logger := otlpr.NewWithOptions(conn, otlpr.Options{
+			LogCaller:     otlpr.All,
+			LogCallerFunc: true,
+			Batcher:       otlpr.Batcher{Messages: 1, Timeout: 5 * time.Second},
+		})
+		logger = otlpr.WithResource(logger, res)
+		logger = otlpr.WithScope(logger, instrumentation.Scope{Name: "github.com/MrAlias/otlpr/example", Version: "v0.3.0"})
+
+		// log = logger
+		// logf.SetLogger(log)
+		println("otlpr loggger configured with:", otlpTarget)
+		log.Info("OTEL sink configured")
+	} else {
+		// logf.SetLogger(zap.New())
+		println("otlpr not configured")
+	}
+}
+
+func initTracer() {
+	exporterStdout, err := stdouttrace.New(
 		stdouttrace.WithPrettyPrint(),
 		//stdouttrace.WithWriter(os.Stderr),
 	)
+	println("exporterStdout created", exporterStdout)
+
 	ctx := context.Background()
-	exporter2, err := otlptracehttp.New(ctx)
+	exporterOtlp, err := otlptracehttp.New(ctx)
 
 	if err != nil {
-		return nil, err
+		log.Error(err, "failed to init trace exporters")
+		os.Exit(1)
 	}
+	println("exporterOtlp created OTEL_EXPORTER_OTLP_ENDPOINT:", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
-	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
+	// Use sdktrace.AlwaysSample sampler to sample all traces.
 	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithBatcher(exporter2),
-		sdktrace.WithSyncer(exporter1),
-		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName("router-service"))),
+		sdktrace.WithBatcher(exporterOtlp),
+		//sdktrace.WithSyncer(exporterStdout), // enabled stdout tracer
+		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-
-	// mainTracer = otel.GetTracerProvider().Tracer("graphtracer")
-	return tp, err
 }
 
 func init() {
+	initLogs()
 	initMeter()
-	_, err := initTracer()
-	if err != nil {
-		log.Error(err, "failed to initTracer")
-	}
-	// defer func() {
-	// 	if err := tp.Shutdown(context.Background()); err != nil {
-	// 		log.Info("Error shutting down tracer provider: %v", err)
-	// 	}
-	// }()
+	initTracer()
 }
 
 func (ReadCloser) Close() error {
@@ -322,16 +349,17 @@ func callService(
 	callClient := http.Client{
 		Transport: otelhttp.NewTransport(
 			transport,
+			/// NOT NEEDED !!!
 			// otelhttp.WithTracerProvider(otel.GetTracerProvider()),
-			//otelhttp.WithTracer(mainTracer),  #### TRIK
+			// otelhttp.WithTracer(mainTracer),  #### TRIK
 			// otelhttp.WithPublicEndpoint(),
 
-			// GEnerate EXTRA spans for dns/sent/reciver
-			otelhttp.WithClientTrace(
-				func(ctx context.Context) *httptrace.ClientTrace {
-					return otelhttptrace.NewClientTrace(ctx)
-				},
-			),
+			// ////  GEnerate EXTRA spans for dns/sent/reciver
+			// otelhttp.WithClientTrace(
+			// 	func(ctx context.Context) *httptrace.ClientTrace {
+			// 		return otelhttptrace.NewClientTrace(ctx)
+			// 	},
+			// ),
 		),
 		Timeout: 600 * time.Second,
 	}
@@ -701,7 +729,10 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 
 		uk := attribute.Key("foo")
 		bag := baggage.FromContext(ctx)
+
 		span.AddEvent("handling this...", trace.WithAttributes(uk.String(bag.Member("bar").Value())))
+
+		otlpr.WithContext(log, ctx).Info("BLADLADLALDLADL", "foz", "blas")
 
 		allTokensStartTime := time.Now()
 		inputBytes, err := io.ReadAll(req.Body)
@@ -740,7 +771,7 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 		ctx, spanFor := mainTracer.Start(ctx, "for")
 		for {
 
-			ctx, span = mainTracer.Start(ctx, "read response partial")
+			_, span = mainTracer.Start(ctx, "read response partial")
 			// measure time of reading another portion of response
 			tokenStartTime := time.Now()
 			n, err := responseBody.Read(buffer)
@@ -764,7 +795,7 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 			}
 
 			// Write the chunk to the ResponseWriter
-			ctx, span = mainTracer.Start(ctx, "reponse write partial")
+			_, span = mainTracer.Start(ctx, "reponse write partial")
 			// measure time of reading another portion of response
 			if _, err := w.Write(buffer[:n]); err != nil {
 				log.Error(err, "failed to write to ResponseWriter")
@@ -958,7 +989,9 @@ func initializeRoutes() *http.ServeMux {
 
 func main() {
 	flag.Parse()
-	logf.SetLogger(zap.New())
+	// zp := zap.NewNop()
+	// logf.SetLogger(*zp)
+	log.Info("READY....")
 
 	mcGraph = &mcv1alpha3.GMConnector{}
 	err := json.Unmarshal([]byte(*jsonGraph), mcGraph)
