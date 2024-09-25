@@ -53,7 +53,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	api "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
@@ -65,8 +64,6 @@ import (
 )
 
 const (
-	OtelServiceName = "router-service"
-
 	BufferSize    = 1024
 	MaxGoroutines = 1024
 	ServiceURL    = "serviceUrl"
@@ -76,6 +73,8 @@ const (
 )
 
 var (
+	OtelServiceName = "router-service" // will be overwriteen by OTEL_SERVICE_NAME
+
 	log logr.Logger
 
 	jsonGraph       = flag.String("graph-json", "", "serialized json graph def")
@@ -166,6 +165,7 @@ func initMeter() {
 	if err != nil {
 		log.Error(err, "metrics: cannot register pipeline histogram measure")
 	}
+	println("otel/metrics: configured")
 }
 
 func initLogs() {
@@ -184,31 +184,57 @@ func initLogs() {
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String(OtelServiceName),
 		)
-		logger := otlpr.NewWithOptions(conn, otlpr.Options{
+		log = otlpr.NewWithOptions(conn, otlpr.Options{
 			LogCaller:     otlpr.All,
 			LogCallerFunc: true,
 			Batcher:       otlpr.Batcher{Messages: 1, Timeout: 5 * time.Second},
 		})
-		logger = otlpr.WithResource(logger, res)
-		logger = otlpr.WithScope(logger, instrumentation.Scope{Name: "github.com/MrAlias/otlpr/example", Version: "v0.3.0"})
+		log = otlpr.WithResource(log, res)
 
-		log = logger
-		println("otlpr loggger configured with:", otlpTarget)
-		log.Info("OTEL sink configured")
+		println("otel/logs: enabled - otlpr logger configured with:", otlpTarget)
+		log.Info("OTEL OTLPR sink configured")
 	} else {
 		log = logf.Log.WithName("GMCGraphRouter")
 		logf.SetLogger(zap.New())
-		println("otlpr not configured")
+		println("otel/logs: disabled - otlrp not configured (OTEL_LOGS_GRPC_ENDPOINT empty)")
 	}
 
 }
 
-func initTracer() {
-	exporterStdout, err := stdouttrace.New(
-		stdouttrace.WithPrettyPrint(),
-		//stdouttrace.WithWriter(os.Stderr),
-	)
-	println("exporterStdout created", exporterStdout)
+func initTraces() {
+	// BY DEFAULT DO NOT INSTALL TRACES if URLS is NOT GIVEN
+	otlpEndpoint, endpointFound := os.LookupEnv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if !endpointFound {
+		println("otel/traces: disabled - OTEL_EXPORTER_OTLP_ENDPOINT not set")
+		return
+	}
+	if otlpEndpoint == "" {
+		println("otel/traces: disabled - OTEL_EXPORTER_OTLP_ENDPOINT is empty ")
+		return
+	}
+
+	if os.Getenv("OTEL_TRACES_DISABLED") == "true" {
+		println("otel/traces: disabled - because of OTEL_TRACES_DISABLED=true")
+		return
+	}
+
+	if os.Getenv("OTEL_TRACES_DISABLED") == "true" {
+		println("otel/traces: disabled - because of OTEL_TRACES_DISABLED=true")
+		return
+	}
+	println("otel/traces: enabled OTEL_EXPORTER_OTLP_ENDPOINT (or default localhost will be used):", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+
+	var exporterStdout *stdouttrace.Exporter
+	var err error
+	if os.Getenv("OTEL_TRACES_CONSOLE_EXPORTER") == "true" {
+		println("otel/traces: console exporter enabled (OTEL_TRACES_CONSOLE_EXPORTER=true)")
+		exporterStdout, err = stdouttrace.New(
+			stdouttrace.WithPrettyPrint(),
+			//stdouttrace.WithWriter(os.Stderr),
+		)
+	} else {
+		println("otel/traces: console exporter disabled (missing OTEL_TRACES_CONSOLE_EXPORTER=true)")
+	}
 
 	ctx := context.Background()
 	exporterOtlp, err := otlptracehttp.New(ctx)
@@ -217,14 +243,13 @@ func initTracer() {
 		log.Error(err, "failed to init trace exporters")
 		os.Exit(1)
 	}
-	println("exporterOtlp created OTEL_EXPORTER_OTLP_ENDPOINT:", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
 	// Use sdktrace.AlwaysSample sampler to sample all traces.
 	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 		sdktrace.WithBatcher(exporterOtlp),
-		//sdktrace.WithSyncer(exporterStdout), // enabled stdout tracer
+		sdktrace.WithSyncer(exporterStdout),
 		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
 	)
 	// Later us this like this: mainTracer := otel.GetTracerProvider().Tracer("graphtracer")
@@ -233,9 +258,14 @@ func initTracer() {
 }
 
 func init() {
+	serviceNameFromEnv, found := os.LookupEnv("OTEL_SERVICE_NAME")
+	if found {
+		OtelServiceName = serviceNameFromEnv
+	}
+	println("otel: servicename:", OtelServiceName)
 	initMeter()
 	initLogs()
-	initTracer()
+	initTraces()
 }
 
 func (ReadCloser) Close() error {
@@ -996,7 +1026,6 @@ func initializeRoutes() *http.ServeMux {
 
 func main() {
 	flag.Parse()
-	log.Info("READY....")
 
 	mcGraph = &mcv1alpha3.GMConnector{}
 	err := json.Unmarshal([]byte(*jsonGraph), mcGraph)
@@ -1005,6 +1034,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	log.Info("Listen on :8080")
 	mcRouter := initializeRoutes()
 
 	server := &http.Server{
