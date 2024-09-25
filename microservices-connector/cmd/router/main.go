@@ -28,10 +28,12 @@ import (
 	"time"
 
 	"github.com/MrAlias/otlpr"
+	"github.com/go-logr/logr"
 	"github.com/tidwall/gjson"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	// "crypto/rand"
 	// "math/big"
@@ -74,8 +76,9 @@ const (
 )
 
 var (
+	log logr.Logger
+
 	jsonGraph       = flag.String("graph-json", "", "serialized json graph def")
-	log             = logf.Log.WithName("GMCGraphRouter")
 	mcGraph         *mcv1alpha3.GMConnector
 	defaultNodeName = "root"
 	semaphore       = make(chan struct{}, MaxGoroutines)
@@ -166,7 +169,9 @@ func initMeter() {
 }
 
 func initLogs() {
-	// https://github.com/MrAlias/otlpr
+	// if OTEL_LOGS_GRPC_ENDPOINT is set to grpc otlp endpoint like this OTEL_LOGS_GRPC_ENDPOINT=127.0.0.1:4317
+	// then global variable log (logr.Logger) will be replaced with logr with sink that sends data to otlp endpoint https://github.com/MrAlias/otlpr
+	// otherwise log uses zap from controller-runtime logf.WithName...
 	otlpTarget, configured := os.LookupEnv("OTEL_LOGS_GRPC_ENDPOINT")
 	if configured {
 		conn, err := grpc.NewClient(otlpTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -187,14 +192,15 @@ func initLogs() {
 		logger = otlpr.WithResource(logger, res)
 		logger = otlpr.WithScope(logger, instrumentation.Scope{Name: "github.com/MrAlias/otlpr/example", Version: "v0.3.0"})
 
-		// log = logger
-		// logf.SetLogger(log)
+		log = logger
 		println("otlpr loggger configured with:", otlpTarget)
 		log.Info("OTEL sink configured")
 	} else {
-		// logf.SetLogger(zap.New())
+		log = logf.Log.WithName("GMCGraphRouter")
+		logf.SetLogger(zap.New())
 		println("otlpr not configured")
 	}
+
 }
 
 func initTracer() {
@@ -221,13 +227,14 @@ func initTracer() {
 		//sdktrace.WithSyncer(exporterStdout), // enabled stdout tracer
 		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
 	)
+	// Later us this like this: mainTracer := otel.GetTracerProvider().Tracer("graphtracer")
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 }
 
 func init() {
-	initLogs()
 	initMeter()
+	initLogs()
 	initTracer()
 }
 
@@ -989,8 +996,6 @@ func initializeRoutes() *http.ServeMux {
 
 func main() {
 	flag.Parse()
-	// zp := zap.NewNop()
-	// logf.SetLogger(*zp)
 	log.Info("READY....")
 
 	mcGraph = &mcv1alpha3.GMConnector{}
