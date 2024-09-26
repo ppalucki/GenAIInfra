@@ -224,21 +224,8 @@ func initTraces() {
 	}
 	println("otel/traces: enabled OTEL_EXPORTER_OTLP_ENDPOINT (or default localhost will be used):", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
-	var exporterStdout *stdouttrace.Exporter
-	var err error
-	if os.Getenv("OTEL_TRACES_CONSOLE_EXPORTER") == "true" {
-		println("otel/traces: console exporter enabled (OTEL_TRACES_CONSOLE_EXPORTER=true)")
-		exporterStdout, err = stdouttrace.New(
-			stdouttrace.WithPrettyPrint(),
-			//stdouttrace.WithWriter(os.Stderr),
-		)
-	} else {
-		println("otel/traces: console exporter disabled (missing OTEL_TRACES_CONSOLE_EXPORTER=true)")
-	}
-
 	ctx := context.Background()
 	exporterOtlp, err := otlptracehttp.New(ctx)
-
 	if err != nil {
 		log.Error(err, "failed to init trace exporters")
 		os.Exit(1)
@@ -246,12 +233,32 @@ func initTraces() {
 
 	// Use sdktrace.AlwaysSample sampler to sample all traces.
 	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithBatcher(exporterOtlp),
-		sdktrace.WithSyncer(exporterStdout),
-		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
-	)
+	var tp trace.TracerProvider
+	if os.Getenv("OTEL_TRACES_CONSOLE_EXPORTER") == "true" {
+		println("otel/traces: console exporter enabled (OTEL_TRACES_CONSOLE_EXPORTER=true)")
+		exporterStdout, err := stdouttrace.New(
+			stdouttrace.WithPrettyPrint(),
+			//stdouttrace.WithWriter(os.Stderr),
+		)
+		if err != nil {
+			log.Error(err, "failed to init trace console exporter")
+			os.Exit(1)
+		}
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			sdktrace.WithBatcher(exporterOtlp),
+			sdktrace.WithSyncer(exporterStdout),
+			sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
+		)
+	} else {
+		println("otel/traces: console exporter disabled (missing OTEL_TRACES_CONSOLE_EXPORTER=true)")
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			sdktrace.WithBatcher(exporterOtlp),
+			sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(OtelServiceName))),
+		)
+	}
+
 	// Later us this like this: mainTracer := otel.GetTracerProvider().Tracer("graphtracer")
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
