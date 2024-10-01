@@ -41,7 +41,7 @@ import (
 	mcv1alpha3 "github.com/opea-project/GenAIInfra/microservices-connector/api/v1alpha3"
 	flag "github.com/spf13/pflag"
 
-	// Metrcis: Prometheus and opentelemetry imports
+	// OpenTelemetry/Metrics: Prometheus and opentelemetry imports
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
@@ -58,7 +58,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
 
-	// OTEL TRACES
+	// OpenTelemetry/Traces:
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -70,6 +70,7 @@ const (
 	ServiceNode   = "node"
 	DataPrep      = "DataPrep"
 	Parameters    = "parameters"
+	OtelVersion   = "v0.3.0"
 )
 
 var (
@@ -84,11 +85,10 @@ var (
 	transport       = &http.Transport{
 		MaxIdleConns:          1000,
 		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       10 * time.Minute,
-		TLSHandshakeTimeout:   10 * time.Minute,
-		ExpectContinueTimeout: 600 * time.Second,
+		IdleConnTimeout:       2 * time.Minute,
+		TLSHandshakeTimeout:   time.Minute,
+		ExpectContinueTimeout: 30 * time.Second,
 	}
-	// mainTracer trace.Tracer
 )
 
 type EnsembleStepOutput struct {
@@ -218,10 +218,6 @@ func initTraces() {
 		return
 	}
 
-	if os.Getenv("OTEL_TRACES_DISABLED") == "true" {
-		println("otel/traces: disabled - because of OTEL_TRACES_DISABLED=true")
-		return
-	}
 	println("otel/traces: enabled OTEL_EXPORTER_OTLP_ENDPOINT (or default localhost will be used):", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
 	ctx := context.Background()
@@ -265,6 +261,7 @@ func initTraces() {
 }
 
 func init() {
+	println("otel: version:", OtelVersion)
 	serviceNameFromEnv, found := os.LookupEnv("OTEL_SERVICE_NAME")
 	if found {
 		OtelServiceName = serviceNameFromEnv
@@ -393,11 +390,6 @@ func callService(
 	callClient := http.Client{
 		Transport: otelhttp.NewTransport(
 			transport,
-			/// NOT NEEDED !!!
-			// otelhttp.WithTracerProvider(otel.GetTracerProvider()),
-			// otelhttp.WithTracer(mainTracer),  #### TRIK
-			// otelhttp.WithPublicEndpoint(),
-
 			// ////  GEnerate EXTRA spans for dns/sent/reciver
 			// otelhttp.WithClientTrace(
 			// 	func(ctx context.Context) *httptrace.ClientTrace {
@@ -405,7 +397,7 @@ func callService(
 			// 	},
 			// ),
 		),
-		Timeout: 600 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 	resp, err := callClient.Do(req)
 	if err != nil {
@@ -769,14 +761,14 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 
 		mainTracer := otel.GetTracerProvider().Tracer("graphtracer")
 		ctx, span := mainTracer.Start(ctx, "read request")
-		// span := trace.SpanFromContext(ctx)
 
+		// Example event
 		uk := attribute.Key("foo")
 		bag := baggage.FromContext(ctx)
-
 		span.AddEvent("handling this...", trace.WithAttributes(uk.String(bag.Member("bar").Value())))
 
-		otlpr.WithContext(log, ctx).Info("BLADLADLALDLADL", "foz", "blas")
+		// Example log entry
+		otlpr.WithContext(log, ctx).Info("Example entry log with some data", "foz", "baz")
 
 		allTokensStartTime := time.Now()
 		inputBytes, err := io.ReadAll(req.Body)
@@ -812,14 +804,18 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		firstTokenCollected := false
 		buffer := make([]byte, BufferSize)
-		ctx, spanFor := mainTracer.Start(ctx, "for")
+		ctx, spanFor := mainTracer.Start(ctx, "tokens")
 		for {
 
-			_, span = mainTracer.Start(ctx, "read response partial")
+			// DETAILED spans (disabled because number of tokens generated!)
+			// _, span = mainTracer.Start(ctx, "read response partial")
+
 			// measure time of reading another portion of response
 			tokenStartTime := time.Now()
 			n, err := responseBody.Read(buffer)
-			span.End()
+
+			// span.End() // "read response partial"
+
 			elapsedTimeMilisecond := float64(time.Since(tokenStartTime)) / float64(time.Millisecond)
 
 			if !firstTokenCollected {
@@ -839,13 +835,18 @@ func mcGraphHandler(w http.ResponseWriter, req *http.Request) {
 			}
 
 			// Write the chunk to the ResponseWriter
-			_, span = mainTracer.Start(ctx, "reponse write partial")
+
+			// DETAILED spans (disabled because number of tokens generated!)
+			// _, span = mainTracer.Start(ctx, "reponse write partial")
+
 			// measure time of reading another portion of response
 			if _, err := w.Write(buffer[:n]); err != nil {
 				log.Error(err, "failed to write to ResponseWriter")
 				return
 			}
-			span.End()
+
+			// span.End() // "response write partial"
+
 			// Flush the data to the client immediately
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -1008,16 +1009,14 @@ func initializeRoutes() *http.ServeMux {
 	// "http.server.response.size" - Int64Counter  - "Measures the size of HTTP response messages" (Incoming response bytes total)
 	// "http.server.duration" - Float64histogram "Measures the duration of inbound HTTP requests." (Incoming end to end duration, milliseconds)
 	handleFunc := func(pattern string, handlerFunc func(http.ResponseWriter, *http.Request), operation string) {
-		// WRAPPED
+		// Wrap with otelhttp handler.
 		handler := otelhttp.NewHandler(
 			otelhttp.WithRouteTag(pattern, http.HandlerFunc(handlerFunc)),
 			operation,
-			// otelhttp.WithTracer(mainTracer), // TRIK
-			//otelhttp.WithTracerProvider(otel.GetTracerProvider()), # breaks there is missing handler trace !!!
 		)
 		mux.Handle(pattern, handler)
 
-		// RAW
+		// Original code with wrapping with OTLP.
 		// mux.Handle(pattern, http.HandlerFunc(handlerFunc))
 	}
 
@@ -1026,7 +1025,7 @@ func initializeRoutes() *http.ServeMux {
 
 	promHandler := promhttp.Handler()
 	handleFunc("/metrics", promHandler.ServeHTTP, "metrics")
-	log.Info("v2 Metrics exposed on /metrics.")
+	log.Info("Metrics exposed on /metrics.", "version", OtelVersion)
 
 	return mux
 }
